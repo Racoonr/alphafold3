@@ -199,6 +199,13 @@ _MAX_TEMPLATE_DATE = flags.DEFINE_string(
     'templates released after this date will be ignored.',
 )
 
+_CONFORMER_MAX_ITERATIONS = flags.DEFINE_integer(
+    'conformer_max_iterations',
+    None,  # Default to RDKit default parameters value.
+    'Optional override for maximum number of iterations to run for RDKit '
+    'conformer search.',
+)
+
 # JAX inference performance tuning.
 _JAX_COMPILATION_CACHE_DIR = flags.DEFINE_string(
     'jax_compilation_cache_dir',
@@ -234,6 +241,13 @@ _NUM_DIFFUSION_SAMPLES = flags.DEFINE_integer(
     'Number of diffusion samples to generate.',
 )
 
+# Output controls.
+_SAVE_EMBEDDINGS = flags.DEFINE_bool(
+    'save_embeddings',
+    False,
+    'Whether to save the final trunk single and pair embeddings in the output.',
+)
+
 
 class ConfigurableModel(Protocol):
   """A model with a nested config class."""
@@ -262,6 +276,7 @@ def make_model_config(
     model_class: type[ModelT] = diffusion_model.Diffuser,
     flash_attention_implementation: attention.Implementation = 'triton',
     num_diffusion_samples: int = 5,
+    return_embeddings: bool = False,
 ):
   """Returns a model config with some defaults overridden."""
   config = model_class.Config()
@@ -271,6 +286,8 @@ def make_model_config(
     )
   if hasattr(config, 'heads'):
     config.heads.diffusion.eval.num_samples = num_diffusion_samples
+  if hasattr(config, 'return_embeddings'):
+    config.return_embeddings = return_embeddings
   return config
 
 
@@ -344,6 +361,18 @@ class ModelRunner:
         )
     )
 
+  def extract_embeddings(
+      self,
+      result: base_model.ModelResult,
+  ) -> dict[str, np.ndarray] | None:
+    """Extracts embeddings from model outputs."""
+    embeddings = {}
+    if 'single_embeddings' in result:
+      embeddings['single_embeddings'] = result['single_embeddings']
+    if 'pair_embeddings' in result:
+      embeddings['pair_embeddings'] = result['pair_embeddings']
+    return embeddings or None
+
 
 @dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
 class ResultsForSeed:
@@ -354,17 +383,20 @@ class ResultsForSeed:
     inference_results: The inference results, one per sample.
     full_fold_input: The fold input that must also include the results of
       running the data pipeline - MSA and templates.
+    embeddings: The final trunk single and pair embeddings, if requested.
   """
 
   seed: int
   inference_results: Sequence[base_model.InferenceResult]
   full_fold_input: folding_input.Input
+  embeddings: dict[str, np.ndarray] | None = None
 
 
 def predict_structure(
     fold_input: folding_input.Input,
     model_runner: ModelRunner,
     buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
   """Runs the full inference pipeline to predict structures for each seed."""
 
@@ -372,7 +404,11 @@ def predict_structure(
   featurisation_start_time = time.time()
   ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
   featurised_examples = featurisation.featurise_input(
-      fold_input=fold_input, buckets=buckets, ccd=ccd, verbose=True
+      fold_input=fold_input,
+      buckets=buckets,
+      ccd=ccd,
+      verbose=True,
+      conformer_max_iterations=conformer_max_iterations,
   )
   print(
       f'Featurising data for seeds {fold_input.rng_seeds} took '
@@ -398,11 +434,15 @@ def predict_structure(
         f'Extracting output structures (one per sample) for seed {seed} took '
         f' {time.time() - extract_structures:.2f} seconds.'
     )
+
+    embeddings = model_runner.extract_embeddings(result)
+
     all_inference_results.append(
         ResultsForSeed(
             seed=seed,
             inference_results=inference_results,
             full_fold_input=fold_input,
+            embeddings=embeddings,
         )
     )
     print(
@@ -457,6 +497,13 @@ def write_outputs(
       if max_ranking_score is None or ranking_score > max_ranking_score:
         max_ranking_score = ranking_score
         max_ranking_result = result
+
+    if embeddings := results_for_seed.embeddings:
+      embeddings_dir = os.path.join(output_dir, f'seed-{seed}_embeddings')
+      os.makedirs(embeddings_dir, exist_ok=True)
+      post_processing.write_embeddings(
+          embeddings=embeddings, output_dir=embeddings_dir
+      )
 
   if max_ranking_result is not None:  # True iff ranking_scores non-empty.
     post_processing.write_output(
@@ -518,6 +565,7 @@ def process_fold_input(
     model_runner: ModelRunner | None,
     output_dir: os.PathLike[str] | str,
     buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
 ) -> folding_input.Input | Sequence[ResultsForSeed]:
   """Runs data pipeline and/or inference on a single fold input.
 
@@ -532,6 +580,8 @@ def process_fold_input(
       number of tokens. If not None, must be a sequence of at least one integer,
       in strictly increasing order. Will raise an error if the number of tokens
       is more than the largest bucket size.
+    conformer_max_iterations: Optional override for maximum number of iterations
+      to run for RDKit conformer search.
 
   Returns:
     The processed fold input, or the inference results for each seed.
@@ -581,6 +631,7 @@ def process_fold_input(
         fold_input=fold_input,
         model_runner=model_runner,
         buckets=buckets,
+        conformer_max_iterations=conformer_max_iterations,
     )
     print(
         f'Writing outputs for {fold_input.name} for seed(s)'
@@ -707,6 +758,7 @@ def main(_):
                 attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
             ),
             num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
+            return_embeddings=_SAVE_EMBEDDINGS.value,
         ),
         device=devices[0],
         model_dir=pathlib.Path(MODEL_DIR.value),
@@ -725,6 +777,7 @@ def main(_):
         model_runner=model_runner,
         output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
         buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
+        conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
     )
     num_fold_inputs += 1
 
